@@ -21,8 +21,8 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/clustersnapshot"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 )
 
 const (
@@ -33,24 +33,42 @@ const (
 // AvailableEstimators is a list of available estimators.
 var AvailableEstimators = []string{BinpackingEstimatorName}
 
+// PodEquivalenceGroup represents a group of pods, which have the same scheduling
+// requirements and are managed by the same controller.
+type PodEquivalenceGroup struct {
+	Pods []*apiv1.Pod
+}
+
+// Exemplar returns an example pod from the group.
+func (p *PodEquivalenceGroup) Exemplar() *apiv1.Pod {
+	if len(p.Pods) == 0 {
+		return nil
+	}
+	return p.Pods[0]
+}
+
 // Estimator calculates the number of nodes of given type needed to schedule pods.
 // It returns the number of new nodes needed as well as the list of pods it managed
 // to schedule on those nodes.
 type Estimator interface {
-	Estimate([]*apiv1.Pod, *schedulerframework.NodeInfo, cloudprovider.NodeGroup) (int, []*apiv1.Pod)
+	// Estimate estimates how many nodes are needed to provision pods coming from the given equivalence groups.
+	Estimate([]PodEquivalenceGroup, *framework.NodeInfo, cloudprovider.NodeGroup) (int, []*apiv1.Pod)
 }
 
 // EstimatorBuilder creates a new estimator object.
-type EstimatorBuilder func(simulator.PredicateChecker, simulator.ClusterSnapshot) Estimator
+type EstimatorBuilder func(clustersnapshot.ClusterSnapshot, EstimationContext) Estimator
+
+// EstimationAnalyserFunc to be run at the end of the estimation logic.
+type EstimationAnalyserFunc func(clustersnapshot.ClusterSnapshot, cloudprovider.NodeGroup, map[string]bool)
 
 // NewEstimatorBuilder creates a new estimator object from flag.
-func NewEstimatorBuilder(name string, limiter EstimationLimiter) (EstimatorBuilder, error) {
+func NewEstimatorBuilder(name string, limiter EstimationLimiter, orderer EstimationPodOrderer, estimationAnalyserFunc EstimationAnalyserFunc) (EstimatorBuilder, error) {
 	switch name {
 	case BinpackingEstimatorName:
 		return func(
-			predicateChecker simulator.PredicateChecker,
-			clusterSnapshot simulator.ClusterSnapshot) Estimator {
-			return NewBinpackingNodeEstimator(predicateChecker, clusterSnapshot, limiter)
+			clusterSnapshot clustersnapshot.ClusterSnapshot,
+			context EstimationContext) Estimator {
+			return NewBinpackingNodeEstimator(clusterSnapshot, limiter, orderer, context, estimationAnalyserFunc)
 		}, nil
 	}
 	return nil, fmt.Errorf("unknown estimator: %s", name)
@@ -61,7 +79,7 @@ func NewEstimatorBuilder(name string, limiter EstimationLimiter) (EstimatorBuild
 // scale-up is limited by external factors.
 type EstimationLimiter interface {
 	// StartEstimation is called at the start of estimation.
-	StartEstimation([]*apiv1.Pod, cloudprovider.NodeGroup)
+	StartEstimation([]PodEquivalenceGroup, cloudprovider.NodeGroup, EstimationContext)
 	// EndEstimation is called at the end of estimation.
 	EndEstimation()
 	// PermissionToAddNode is called by an estimator when it wants to add additional
@@ -70,4 +88,10 @@ type EstimationLimiter interface {
 	// There is no requirement for the Estimator to stop calculations, it's
 	// just not expected to add any more nodes.
 	PermissionToAddNode() bool
+}
+
+// EstimationPodOrderer is an interface used to determine the order of the pods
+// used while binpacking during scale up estimation
+type EstimationPodOrderer interface {
+	Order(podsEquivalentGroups []PodEquivalenceGroup, nodeTemplate *framework.NodeInfo, nodeGroup cloudprovider.NodeGroup) []PodEquivalenceGroup
 }

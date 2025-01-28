@@ -17,22 +17,36 @@ limitations under the License.
 package alicloud
 
 import (
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/alicloud/metadata"
-	klog "k8s.io/klog/v2"
 	"os"
+
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/alicloud/metadata"
+	"k8s.io/klog/v2"
 )
 
 const (
-	accessKeyId     = "ACCESS_KEY_ID"
-	accessKeySecret = "ACCESS_KEY_SECRET"
-	regionId        = "REGION_ID"
+	accessKeyId          = "ACCESS_KEY_ID"
+	accessKeySecret      = "ACCESS_KEY_SECRET"
+	oidcProviderARN      = "ALIBABA_CLOUD_OIDC_PROVIDER_ARN"
+	oldOidcProviderARN   = "ALICLOUD_OIDC_PROVIDER_ARN"
+	oidcTokenFilePath    = "ALIBABA_CLOUD_OIDC_TOKEN_FILE"
+	oldOidcTokenFilePath = "ALICLOUD_OIDC_TOKEN_FILE_PATH"
+	roleARN              = "ALIBABA_CLOUD_ROLE_ARN"
+	oldRoleARN           = "ALICLOUD_ROLE_ARN"
+	roleSessionName      = "ALIBABA_CLOUD_SESSION_NAME"
+	oldRoleSessionName   = "ALICLOUD_SESSION_NAME"
+	regionId             = "REGION_ID"
 )
 
 type cloudConfig struct {
-	RegionId        string
-	AccessKeyID     string
-	AccessKeySecret string
-	STSEnabled      bool
+	RegionId          string
+	AccessKeyID       string
+	AccessKeySecret   string
+	OIDCProviderARN   string
+	OIDCTokenFilePath string
+	RoleARN           string
+	RoleSessionName   string
+	RRSAEnabled       bool
+	STSEnabled        bool
 }
 
 func (cc *cloudConfig) isValid() bool {
@@ -48,18 +62,40 @@ func (cc *cloudConfig) isValid() bool {
 		cc.RegionId = os.Getenv(regionId)
 	}
 
-	if cc.RegionId == "" || cc.AccessKeyID == "" || cc.AccessKeySecret == "" {
-		klog.V(5).Infof("Failed to get AccessKeyId:%s,AccessKeySecret:%s,RegionId:%s from cloudConfig and Env\n", cc.AccessKeyID, cc.AccessKeySecret, cc.RegionId)
+	if cc.OIDCProviderARN == "" {
+		cc.OIDCProviderARN = firstNotEmpty(os.Getenv(oidcProviderARN), os.Getenv(oldOidcProviderARN))
+	}
+
+	if cc.OIDCTokenFilePath == "" {
+		cc.OIDCTokenFilePath = firstNotEmpty(os.Getenv(oidcTokenFilePath), os.Getenv(oldOidcTokenFilePath))
+	}
+
+	if cc.RoleARN == "" {
+		cc.RoleARN = firstNotEmpty(os.Getenv(roleARN), os.Getenv(oldRoleARN))
+	}
+
+	if cc.RoleSessionName == "" {
+		cc.RoleSessionName = firstNotEmpty(os.Getenv(roleSessionName), os.Getenv(oldRoleSessionName))
+	}
+
+	if cc.RegionId != "" && cc.AccessKeyID != "" && cc.AccessKeySecret != "" {
+		klog.V(2).Info("Using AccessKey authentication")
+		return true
+	} else if cc.RegionId != "" && cc.OIDCProviderARN != "" && cc.OIDCTokenFilePath != "" && cc.RoleARN != "" && cc.RoleSessionName != "" {
+		klog.V(2).Info("Using RRSA authentication")
+		cc.RRSAEnabled = true
+		return true
+	} else {
+		klog.V(5).Infof("Failed to get AccessKeyId:%s,RegionId:%s from cloudConfig and Env\n", cc.AccessKeyID, cc.RegionId)
+		klog.V(5).Infof("Failed to get OIDCProviderARN:%s,OIDCTokenFilePath:%s,RoleARN:%s,RoleSessionName:%s,RegionId:%s from cloudConfig and Env\n", cc.OIDCProviderARN, cc.OIDCTokenFilePath, cc.RoleARN, cc.RoleSessionName, cc.RegionId)
 		klog.V(5).Infof("Try to use sts token in metadata instead.\n")
-		if cc.validateSTSToken() == true && cc.getRegion() != "" {
+		if cc.validateSTSToken() && cc.getRegion() != "" {
 			//if CA is working on ECS with valid role name, use sts token instead.
 			cc.STSEnabled = true
 			return true
 		}
-	} else {
-		cc.STSEnabled = false
-		return true
 	}
+
 	return false
 }
 
@@ -96,4 +132,16 @@ func (cc *cloudConfig) getRegion() string {
 		klog.Errorf("Failed to get RegionId from metadata.Because of %s\n", err.Error())
 	}
 	return r
+}
+
+// firstNotEmpty returns the first non-empty string from the input list.
+// If all strings are empty or no arguments are provided, it returns an empty string.
+func firstNotEmpty(strs ...string) string {
+	for _, str := range strs {
+		if str != "" {
+			return str
+		}
+	}
+
+	return ""
 }

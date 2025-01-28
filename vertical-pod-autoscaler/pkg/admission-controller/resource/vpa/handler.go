@@ -17,6 +17,7 @@ limitations under the License.
 package vpa
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -71,7 +72,7 @@ func (h *resourceHandler) DisallowIncorrectObjects() bool {
 }
 
 // GetPatches builds patches for VPA in given admission request.
-func (h *resourceHandler) GetPatches(ar *v1.AdmissionRequest) ([]resource.PatchRecord, error) {
+func (h *resourceHandler) GetPatches(_ context.Context, ar *v1.AdmissionRequest) ([]resource.PatchRecord, error) {
 	raw, isCreate := ar.Object.Raw, ar.Operation == v1.Create
 	vpa, err := parseVPA(raw)
 	if err != nil {
@@ -83,12 +84,12 @@ func (h *resourceHandler) GetPatches(ar *v1.AdmissionRequest) ([]resource.PatchR
 		return nil, err
 	}
 
-	err = validateVPA(vpa, isCreate)
+	err = ValidateVPA(vpa, isCreate)
 	if err != nil {
 		return nil, err
 	}
 
-	klog.V(4).Infof("Processing vpa: %v", vpa)
+	klog.V(4).InfoS("Processing vpa", "vpa", vpa)
 	patches := []resource.PatchRecord{}
 	if vpa.Spec.UpdatePolicy == nil {
 		// Sets the default updatePolicy.
@@ -109,7 +110,8 @@ func parseVPA(raw []byte) (*vpa_types.VerticalPodAutoscaler, error) {
 	return &vpa, nil
 }
 
-func validateVPA(vpa *vpa_types.VerticalPodAutoscaler, isCreate bool) error {
+// ValidateVPA checks the correctness of VPA Spec and returns an error if there is a problem.
+func ValidateVPA(vpa *vpa_types.VerticalPodAutoscaler, isCreate bool) error {
 	if vpa.Spec.UpdatePolicy != nil {
 		mode := vpa.Spec.UpdatePolicy.UpdateMode
 		if mode == nil {

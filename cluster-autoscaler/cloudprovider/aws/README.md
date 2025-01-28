@@ -47,8 +47,12 @@ should be updated to restrict the resources/add conditionals:
         "autoscaling:DescribeAutoScalingGroups",
         "autoscaling:DescribeAutoScalingInstances",
         "autoscaling:DescribeLaunchConfigurations",
+        "autoscaling:DescribeScalingActivities",
+        "ec2:DescribeImages",
         "ec2:DescribeInstanceTypes",
-        "ec2:DescribeLaunchTemplateVersions"
+        "ec2:DescribeLaunchTemplateVersions",
+        "ec2:GetInstanceTypesFromInstanceRequirements",
+        "eks:DescribeNodegroup"
       ],
       "Resource": ["*"]
     },
@@ -56,11 +60,7 @@ should be updated to restrict the resources/add conditionals:
       "Effect": "Allow",
       "Action": [
         "autoscaling:SetDesiredCapacity",
-        "autoscaling:TerminateInstanceInAutoScalingGroup",
-        "ec2:DescribeImages",
-        "ec2:DescribeInstanceTypes",
-        "ec2:GetInstanceTypesFromInstanceRequirements",
-        "eks:DescribeNodegroup"
+        "autoscaling:TerminateInstanceInAutoScalingGroup"
       ],
       "Resource": ["*"]
     }
@@ -109,7 +109,9 @@ binary, replacing min and max node counts and the ASG:
 
 The `"eks:DescribeNodegroup"` permission allows Cluster Autoscaler to pull labels and taints from the EKS DescribeNodegroup API for EKS managed nodegroups. (Note: When an EKS DescribeNodegroup API label and a tag on the underlying autoscaling group have the same key, the EKS DescribeNodegroup API label value will be saved by the Cluster Autoscaler over the autoscaling group tag value.) Currently the Cluster Autoscaler will only call the EKS DescribeNodegroup API when a managed nodegroup is created with 0 nodes and has never had any nodes added to it. Once nodes are added, even if the managed nodegroup is scaled back to 0 nodes, this functionality will not be called anymore. In the case of a Cluster Autoscaler restart, the Cluster Autoscaler will need to repopulate caches so it will call this functionality again if the managed nodegroup is at 0 nodes. Enabling this functionality any time there are 0 nodes in a managed nodegroup (even after a scale-up then scale-down) would require changes to the general shared Cluster Autoscaler code which could happen in the future.
 
-NOTE: PrivateLink is not yet supported by EKS APIs so the EKS DescribeNodegroup API call will not work in a private cluster.
+NOTE: For private clusters, in order for the EKS DescribeNodegroup API to work,
+you need to create an interface endpoint for Amazon EKS (AWS PrivateLink), as
+described at the [AWS Documentation](https://docs.aws.amazon.com/eks/latest/userguide/vpc-interface-endpoints.html).
 
 ### Using OIDC Federated Authentication
 
@@ -164,9 +166,12 @@ Auto-Discovery Setup is the preferred method to configure Cluster Autoscaler.
 
 To enable this, provide the `--node-group-auto-discovery` flag as an argument
 whose value is a list of tag keys that should be looked for. For example,
-`--node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/<cluster-name>,my-custom-tag=custom-value`
-will find the ASGs that have the given tags. Optionally, a value can be provided
-for each tag as well.
+`--node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/<cluster-name>`
+will find the ASGs that have at least all the given tags. Without the tags, the Cluster Autoscaler will be unable to add new instances
+to the ASG as it has not been discovered. In the example, a value is not given for the tags and in this case any value will be ignored and
+will be arbitrary - only the tag name matters. Optionally, the tag value can be set to be usable and custom tags can also be added. For example,
+`--node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled=foo,k8s.io/cluster-autoscaler/<cluster-name>=bar,my-custom-tag=custom-value`.
+Now the ASG tags must have the correct values as well as the custom tag to be successfully discovered by the Cluster Autoscaler.
 
 Example deployment:
 
@@ -192,18 +197,24 @@ only the first instance type found will be used. See [Using Mixed Instances
 Policies and Spot Instances](#Using-Mixed-Instances-Policies-and-Spot-Instances)
 for details.
 
-Cluster Autoscaler supports hints that nodes will be labelled when they join the
-cluster via ASG tags. The tag is of the format
-`k8s.io/cluster-autoscaler/node-template/label/<label-name>`. `<label-name>` is
+When scaling up from 0 nodes, the Cluster Autoscaler reads ASG tags to derive information about the specifications of the nodes
+i.e labels and taints in that ASG. Note that it does not actually apply these labels or taints - this is done by an AWS generated
+user data script. It gives the Cluster Autoscaler information about whether pending pods will be able to be scheduled should a new node
+be spun up for a particular ASG with the asumption the ASG tags accurately reflect the labels/taint actually applied.
+
+The following is only required if scaling up from 0 nodes. The Cluster Autoscaler will require the label tag
+on the ASG should a deployment have a NodeSelector, else no scaling will occur as the Cluster Autoscaler does not realise
+the ASG has that particular label. The tag is of the format
+`k8s.io/cluster-autoscaler/node-template/label/<label-name>`: `<label-value>` is
 the name of the label and the value of each tag specifies the label value.
 
 Example tags:
 
 - `k8s.io/cluster-autoscaler/node-template/label/foo`: `bar`
 
-Cluster Autoscaler supports hints that nodes will be tainted when they join the
-cluster via ASG tags. The tag is of the format
-`k8s.io/cluster-autoscaler/node-template/taint/<taint-name>`. `<taint-name>` is
+The following is only required if scaling up from 0 nodes. The Cluster Autoscaler will require the taint tag
+on the ASG, else tainted nodes may get spun up that cannot actually have the pending pods run on it. The tag is of the format
+`k8s.io/cluster-autoscaler/node-template/taint/<taint-name>`:`<taint-value:taint-effect>` is
 the name of the taint and the value of each tag specifies the taint value and effect with the format `<taint-value>:<taint-effect>`.
 
 Example tags:
@@ -234,6 +245,8 @@ as string). Currently supported autoscaling options (and example values) are:
   (overrides `--scale-down-unneeded-time` value for that specific ASG)
 * `k8s.io/cluster-autoscaler/node-template/autoscaling-options/scaledownunreadytime`: `20m0s`
   (overrides `--scale-down-unready-time` value for that specific ASG)
+* `k8s.io/cluster-autoscaler/node-template/autoscaling-options/ignoredaemonsetsutilization`: `true`
+  (overrides `--ignore-daemonsets-utilization` value for that specific ASG)
 
 **NOTE:** It is your responsibility to ensure such labels and/or taints are
 applied via the node's kubelet configuration at startup. Cluster Autoscaler will not set the node taints for you.
@@ -243,7 +256,9 @@ Recommendations:
 - It is recommended to use a second tag like
   `k8s.io/cluster-autoscaler/<cluster-name>` when
   `k8s.io/cluster-autoscaler/enabled` is used across many clusters to prevent
-  ASGs from different clusters recognized as the node groups.
+  ASGs from different clusters having conflicts.
+  An ASG must contain at least all the tags specified and as such secondary tags can differentiate between different
+  clusters ASGs.
 - To prevent conflicts, do not provide a `--nodes` argument if
   `--node-group-auto-discovery` is specified.
 - Be sure to add `autoscaling:DescribeLaunchConfigurations` or
@@ -252,7 +267,7 @@ Recommendations:
   Configurations or Launch Templates.
 - If Cluster Autoscaler adds a node to the cluster, and the node has taints applied
   when it joins the cluster that Cluster Autoscaler was unaware of (because the tag
-  wasn't supplied), this can lead to significant confusion and misbehaviour.
+  wasn't supplied in ASG), this can lead to significant confusion and misbehaviour.
 
 ### Special note on GPU instances
 
@@ -411,15 +426,52 @@ To refresh static list, please run `go run ec2_instance_types/gen.go` under
 
 ## Using the AWS SDK vendored in the AWS cloudprovider
 
-If you want to use a newer version of the AWS SDK than the version currently vendored as a direct dependency by Cluster Autoscaler, then you can use the version vendored under this AWS cloudprovider. 
+If you want to use a newer version of the AWS SDK than the version currently vendored as a direct dependency by Cluster Autoscaler, then you can use the version vendored under this AWS cloudprovider.
 
-The current version vendored is `v1.44.24`.
+The current version vendored is `v1.48.7`.
 
 If you want to update the vendored AWS SDK to a newer version, please make sure of the following:
 
 1. Place the copy of the new desired version of the AWS SDK under the `aws-sdk-go` directory.
-2. Update the import statements within the newly-copied AWS SDK to reference the new paths (e.g., `github.com/aws/aws-sdk-go/aws/awsutil` -> `k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/aws/awsutil`).
-3. Update the version number above to indicate the new vendored version.
+2. Remove folders : models and examples. Remove _test.go file `find . -name '*_test.go' -exec rm {}+`
+3. Update the import statements within the newly-copied AWS SDK to reference the new paths (e.g., `github.com/aws/aws-sdk-go/aws/awsutil` -> `k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/aws/awsutil`). You can use this command from the aws-sdk-go folder `find . -type f -exec sed -i ‘s#github.com/aws/aws-sdk-go#k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go#’ {} \;`
+4. Update the version number above to indicate the new vendored version.
+
+## Using cloud config with helm
+
+If you want to use custom AWS cloud config e.g. endpoint urls
+
+1. Create ConfigMap with cloud config file definition (see [example](examples/configmap-cloudconfig-example.yaml)):
+   ```shell
+   kubectl apply -f examples/configmap-cloudconfig-example.yaml
+   ```
+2. Add the following in your `values.yaml`:
+    ```yaml
+    cloudConfigPath: config/cloud.conf
+
+    extraVolumes:
+      - name: cloud-config
+        configMap:
+          name: cloud-config
+
+    extraVolumeMounts:
+      - name: cloud-config
+        mountPath: config
+    ```
+3. Install (or upgrade) helm chart with updated values (see [example](examples/values-cloudconfig-example.yaml))
+
+Please note: it is also possible to mount the cloud config file from host:
+```yaml
+    extraVolumes:
+      - name: cloud-config
+        hostPath:
+          path: /path/to/file/on/host
+
+    extraVolumeMounts:
+      - name: cloud-config
+        mountPath: config/cloud.conf
+        readOnly: true
+```
 
 ## Common Notes and Gotchas:
 
@@ -444,11 +496,8 @@ If you want to update the vendored AWS SDK to a newer version, please make sure 
   enabled, which means it will actively work to balance the number of instances
   between AZs, and possibly terminate instances. If your applications could be
   impacted from sudden termination, you can either suspend the AZRebalance
-  feature, or use a tool for automatic draining upon ASG scale-in such as the
-  [k8s-node-drainer](https://github.com/aws-samples/amazon-k8s-node-drainer). The
-  [AWS Node Termination
-  Handler](https://github.com/aws/aws-node-termination-handler/issues/95) will
-  also support this use-case in the future.
+  feature, or use a tool for automatic draining upon ASG scale-in such as the [AWS Node Termination
+  Handler](https://github.com/aws/aws-node-termination-handler/).
 - By default, cluster autoscaler will not terminate nodes running pods in the
   kube-system namespace. You can override this default behaviour by passing in
   the `--skip-nodes-with-system-pods=false` flag.
@@ -457,12 +506,14 @@ If you want to update the vendored AWS SDK to a newer version, please make sure 
   `--scale-down-delay-after-delete`, and `--scale-down-delay-after-failure`
   flag. E.g. `--scale-down-delay-after-add=5m` to decrease the scale down delay
   to 5 minutes after a node has been added.
-- If you're running multiple ASGs, the `--expander` flag supports three options:
-  `random`, `most-pods` and `least-waste`. `random` will expand a random ASG on
-  scale up. `most-pods` will scale up the ASG that will schedule the most amount
-  of pods. `least-waste` will expand the ASG that will waste the least amount of
-  CPU/MEM resources. In the event of a tie, cluster autoscaler will fall back to
-  `random`.
+- If you're running multiple ASGs, the `--expander` flag supports five options:
+  `random`, `most-pods`, `least-waste`, `priority`, and `grpc`. `random` will
+  expand a random ASG on scale up. `most-pods` will scale up the ASG that will
+  schedule the most amount of pods. `least-waste` will expand the ASG that will
+  waste the least amount of CPU/MEM resources. In the event of a tie, cluster
+  autoscaler will fall back to`random`.  The `priority` expander lets you define
+  a custom priority ranking in a ConfigMap for selecting ASGs, and the `grpc`
+  expander allows you to write your own expansion logic.
 - If you're managing your own kubelets, they need to be started with the
   `--provider-id` flag. The provider id has the format
   `aws:///<availability-zone>/<instance-id>`, e.g.
@@ -473,3 +524,5 @@ If you want to update the vendored AWS SDK to a newer version, please make sure 
   EC2 launch configuration has the setting `Metadata response hop limit` set to `2`.
   Otherwise, the `/latest/api/token` call will timeout and result in an error. See [AWS docs here](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html#configuring-instance-metadata-options) for further information.
 - If you don't use EKS managed nodegroups, don't add the `eks:nodegroup-name` tag to the ASG as this will lead to extra EKS API calls that could slow down scaling when there are 0 nodes in the nodegroup.
+- Set `AWS_MAX_ATTEMPTS` to configure max retries
+- If you are running a private cluster in a VPC without certain VPC interfaces for AWS services, the CA might crash on startup due to failing to dynamically fetch supported EC2-instance types. To avoid this, add the argument `--aws-use-static-instance-list=true` to the CA startup command. For more information on private cluster requirements, see [AWS docs here](https://docs.aws.amazon.com/eks/latest/userguide/private-clusters.html).

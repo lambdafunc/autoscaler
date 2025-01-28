@@ -17,6 +17,7 @@ limitations under the License.
 package nodeinfosprovider
 
 import (
+	"errors"
 	"reflect"
 	"time"
 
@@ -24,40 +25,41 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
-	"k8s.io/autoscaler/cluster-autoscaler/core/utils"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
+	caerror "k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/taints"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
-	klog "k8s.io/klog/v2"
+	"k8s.io/klog/v2"
 )
 
 const stabilizationDelay = 1 * time.Minute
 const maxCacheExpireTime = 87660 * time.Hour
 
 type cacheItem struct {
-	*schedulerframework.NodeInfo
+	*framework.NodeInfo
 	added time.Time
 }
 
 // MixedTemplateNodeInfoProvider build nodeInfos from the cluster's nodes and node groups.
 type MixedTemplateNodeInfoProvider struct {
-	nodeInfoCache map[string]cacheItem
-	ttl           time.Duration
+	nodeInfoCache   map[string]cacheItem
+	ttl             time.Duration
+	forceDaemonSets bool
 }
 
 // NewMixedTemplateNodeInfoProvider returns a NodeInfoProvider processor building
 // NodeInfos from real-world nodes when available, otherwise from node groups templates.
-func NewMixedTemplateNodeInfoProvider(t *time.Duration) *MixedTemplateNodeInfoProvider {
+func NewMixedTemplateNodeInfoProvider(t *time.Duration, forceDaemonSets bool) *MixedTemplateNodeInfoProvider {
 	ttl := maxCacheExpireTime
 	if t != nil {
 		ttl = *t
 	}
 	return &MixedTemplateNodeInfoProvider{
-		nodeInfoCache: make(map[string]cacheItem),
-		ttl:           ttl,
+		nodeInfoCache:   make(map[string]cacheItem),
+		ttl:             ttl,
+		forceDaemonSets: forceDaemonSets,
 	}
 }
 
@@ -70,38 +72,32 @@ func (p *MixedTemplateNodeInfoProvider) CleanUp() {
 }
 
 // Process returns the nodeInfos set for this cluster
-func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext, nodes []*apiv1.Node, daemonsets []*appsv1.DaemonSet, ignoredTaints taints.TaintKeySet, now time.Time) (map[string]*schedulerframework.NodeInfo, errors.AutoscalerError) {
+func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext, nodes []*apiv1.Node, daemonsets []*appsv1.DaemonSet, taintConfig taints.TaintConfig, now time.Time) (map[string]*framework.NodeInfo, caerror.AutoscalerError) {
 	// TODO(mwielgus): This returns map keyed by url, while most code (including scheduler) uses node.Name for a key.
 	// TODO(mwielgus): Review error policy - sometimes we may continue with partial errors.
-	result := make(map[string]*schedulerframework.NodeInfo)
+	result := make(map[string]*framework.NodeInfo)
 	seenGroups := make(map[string]bool)
 
-	podsForNodes, err := getPodsForNodes(ctx.ListerRegistry)
-	if err != nil {
-		return map[string]*schedulerframework.NodeInfo{}, err
-	}
-
 	// processNode returns information whether the nodeTemplate was generated and if there was an error.
-	processNode := func(node *apiv1.Node) (bool, string, errors.AutoscalerError) {
+	processNode := func(node *apiv1.Node) (bool, string, caerror.AutoscalerError) {
 		nodeGroup, err := ctx.CloudProvider.NodeGroupForNode(node)
 		if err != nil {
-			return false, "", errors.ToAutoscalerError(errors.CloudProviderError, err)
+			return false, "", caerror.ToAutoscalerError(caerror.CloudProviderError, err)
 		}
 		if nodeGroup == nil || reflect.ValueOf(nodeGroup).IsNil() {
 			return false, "", nil
 		}
 		id := nodeGroup.Id()
 		if _, found := result[id]; !found {
-			// Build nodeInfo.
-			nodeInfo, err := simulator.BuildNodeInfoForNode(node, podsForNodes)
+			nodeInfo, err := ctx.ClusterSnapshot.GetNodeInfo(node.Name)
 			if err != nil {
-				return false, "", err
+				return false, "", caerror.NewAutoscalerErrorf(caerror.InternalError, "error while retrieving node %s from cluster snapshot - this shouldn't happen: %v", node.Name, err)
 			}
-			sanitizedNodeInfo, err := utils.SanitizeNodeInfo(nodeInfo, id, ignoredTaints)
-			if err != nil {
-				return false, "", err
+			templateNodeInfo, caErr := simulator.SanitizedTemplateNodeInfoFromNodeInfo(nodeInfo, id, daemonsets, p.forceDaemonSets, taintConfig)
+			if caErr != nil {
+				return false, "", caErr
 			}
-			result[id] = sanitizedNodeInfo
+			result[id] = templateNodeInfo
 			return true, id, nil
 		}
 		return false, "", nil
@@ -114,12 +110,11 @@ func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext,
 		}
 		added, id, typedErr := processNode(node)
 		if typedErr != nil {
-			return map[string]*schedulerframework.NodeInfo{}, typedErr
+			return map[string]*framework.NodeInfo{}, typedErr
 		}
 		if added && p.nodeInfoCache != nil {
-			if nodeInfoCopy, err := utils.DeepCopyNodeInfo(result[id]); err == nil {
-				p.nodeInfoCache[id] = cacheItem{NodeInfo: nodeInfoCopy, added: time.Now()}
-			}
+			nodeInfoCopy := result[id].DeepCopy()
+			p.nodeInfoCache[id] = cacheItem{NodeInfo: nodeInfoCopy, added: time.Now()}
 		}
 	}
 	for _, nodeGroup := range ctx.CloudProvider.NodeGroups() {
@@ -134,8 +129,8 @@ func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext,
 			if cacheItem, found := p.nodeInfoCache[id]; found {
 				if p.isCacheItemExpired(cacheItem.added) {
 					delete(p.nodeInfoCache, id)
-				} else if nodeInfoCopy, err := utils.DeepCopyNodeInfo(cacheItem.NodeInfo); err == nil {
-					result[id] = nodeInfoCopy
+				} else {
+					result[id] = cacheItem.NodeInfo.DeepCopy()
 					continue
 				}
 			}
@@ -143,13 +138,13 @@ func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext,
 
 		// No good template, trying to generate one. This is called only if there are no
 		// working nodes in the node groups. By default CA tries to use a real-world example.
-		nodeInfo, err := utils.GetNodeInfoFromTemplate(nodeGroup, daemonsets, ctx.PredicateChecker, ignoredTaints)
+		nodeInfo, err := simulator.SanitizedTemplateNodeInfoFromNodeGroup(nodeGroup, daemonsets, taintConfig)
 		if err != nil {
-			if err == cloudprovider.ErrNotImplemented {
+			if errors.Is(err, cloudprovider.ErrNotImplemented) {
 				continue
 			} else {
 				klog.Errorf("Unable to build proper template node for %s: %v", id, err)
-				return map[string]*schedulerframework.NodeInfo{}, errors.ToAutoscalerError(errors.CloudProviderError, err)
+				return map[string]*framework.NodeInfo{}, caerror.ToAutoscalerError(caerror.CloudProviderError, err)
 			}
 		}
 		result[id] = nodeInfo
@@ -170,12 +165,12 @@ func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext,
 		}
 		added, _, typedErr := processNode(node)
 		if typedErr != nil {
-			return map[string]*schedulerframework.NodeInfo{}, typedErr
+			return map[string]*framework.NodeInfo{}, typedErr
 		}
 		nodeGroup, err := ctx.CloudProvider.NodeGroupForNode(node)
 		if err != nil {
-			return map[string]*schedulerframework.NodeInfo{}, errors.ToAutoscalerError(
-				errors.CloudProviderError, err)
+			return map[string]*framework.NodeInfo{}, caerror.ToAutoscalerError(
+				caerror.CloudProviderError, err)
 		}
 		if added {
 			klog.Warningf("Built template for %s based on unready/unschedulable node %s", nodeGroup.Id(), node.Name)
@@ -183,18 +178,6 @@ func (p *MixedTemplateNodeInfoProvider) Process(ctx *context.AutoscalingContext,
 	}
 
 	return result, nil
-}
-
-func getPodsForNodes(listers kube_util.ListerRegistry) (map[string][]*apiv1.Pod, errors.AutoscalerError) {
-	pods, err := listers.ScheduledPodLister().List()
-	if err != nil {
-		return nil, errors.ToAutoscalerError(errors.ApiCallError, err)
-	}
-	podsForNodes := map[string][]*apiv1.Pod{}
-	for _, p := range pods {
-		podsForNodes[p.Spec.NodeName] = append(podsForNodes[p.Spec.NodeName], p)
-	}
-	return podsForNodes, nil
 }
 
 func isNodeGoodTemplateCandidate(node *apiv1.Node, now time.Time) bool {

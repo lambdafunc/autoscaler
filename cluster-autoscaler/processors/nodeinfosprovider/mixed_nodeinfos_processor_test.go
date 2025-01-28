@@ -20,16 +20,18 @@ import (
 	"testing"
 	"time"
 
-	testprovider "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/test"
-	"k8s.io/autoscaler/cluster-autoscaler/context"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator"
-	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
-	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
-
 	"github.com/stretchr/testify/assert"
+
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	testprovider "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/test"
+	"k8s.io/autoscaler/cluster-autoscaler/context"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/clustersnapshot/testsnapshot"
+	drasnapshot "k8s.io/autoscaler/cluster-autoscaler/simulator/dynamicresources/snapshot"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
+	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
+	"k8s.io/autoscaler/cluster-autoscaler/utils/taints"
+	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
 )
 
 var (
@@ -50,13 +52,12 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 	SetNodeReadyState(justReady5, true, now)
 
 	tn := BuildTestNode("tn", 5000, 5000)
-	tni := schedulerframework.NewNodeInfo()
-	tni.SetNode(tn)
+	tni := framework.NewTestNodeInfo(tn)
 
 	// Cloud provider with TemplateNodeInfo implemented.
 	provider1 := testprovider.NewTestAutoprovisioningCloudProvider(
 		nil, nil, nil, nil, nil,
-		map[string]*schedulerframework.NodeInfo{"ng3": tni, "ng4": tni, "ng5": tni})
+		map[string]*framework.NodeInfo{"ng3": tni, "ng4": tni, "ng5": tni})
 	provider1.AddNodeGroup("ng1", 1, 10, 1) // Nodegroup with ready node.
 	provider1.AddNode("ng1", ready1)
 	provider1.AddNodeGroup("ng2", 1, 10, 1) // Nodegroup with ready and unready node.
@@ -73,19 +74,21 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 	provider2.AddNodeGroup("ng6", 1, 10, 1) // Nodegroup without nodes.
 
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
-	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
+	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil)
 
-	predicateChecker, err := simulator.NewTestPredicateChecker()
+	nodes := []*apiv1.Node{justReady5, unready4, unready3, ready2, ready1}
+	snapshot := testsnapshot.NewTestSnapshotOrDie(t)
+	err := snapshot.SetClusterState(nodes, nil, drasnapshot.Snapshot{})
 	assert.NoError(t, err)
 
 	ctx := context.AutoscalingContext{
-		CloudProvider:    provider1,
-		PredicateChecker: predicateChecker,
+		CloudProvider:   provider1,
+		ClusterSnapshot: snapshot,
 		AutoscalingKubeClients: context.AutoscalingKubeClients{
 			ListerRegistry: registry,
 		},
 	}
-	res, err := NewMixedTemplateNodeInfoProvider(&cacheTtl).Process(&ctx, []*apiv1.Node{justReady5, unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	res, err := NewMixedTemplateNodeInfoProvider(&cacheTtl, false).Process(&ctx, nodes, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 5, len(res))
 	info, found := res["ng1"]
@@ -106,13 +109,13 @@ func TestGetNodeInfosForGroups(t *testing.T) {
 
 	// Test for a nodegroup without nodes and TemplateNodeInfo not implemented by cloud proivder
 	ctx = context.AutoscalingContext{
-		CloudProvider:    provider2,
-		PredicateChecker: predicateChecker,
+		CloudProvider:   provider2,
+		ClusterSnapshot: testsnapshot.NewTestSnapshotOrDie(t),
 		AutoscalingKubeClients: context.AutoscalingKubeClients{
 			ListerRegistry: registry,
 		},
 	}
-	res, err = NewMixedTemplateNodeInfoProvider(&cacheTtl).Process(&ctx, []*apiv1.Node{}, []*appsv1.DaemonSet{}, nil, now)
+	res, err = NewMixedTemplateNodeInfoProvider(&cacheTtl, false).Process(&ctx, []*apiv1.Node{}, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 0, len(res))
 }
@@ -133,8 +136,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	SetNodeReadyState(ready6, true, now.Add(-2*time.Minute))
 
 	tn := BuildTestNode("tn", 10000, 10000)
-	tni := schedulerframework.NewNodeInfo()
-	tni.SetNode(tn)
+	tni := framework.NewTestNodeInfo(tn)
 
 	lastDeletedGroup := ""
 	onDeleteGroup := func(id string) error {
@@ -145,7 +147,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	// Cloud provider with TemplateNodeInfo implemented.
 	provider1 := testprovider.NewTestAutoprovisioningCloudProvider(
 		nil, nil, nil, onDeleteGroup, nil,
-		map[string]*schedulerframework.NodeInfo{"ng3": tni, "ng4": tni})
+		map[string]*framework.NodeInfo{"ng3": tni, "ng4": tni})
 	provider1.AddNodeGroup("ng1", 1, 10, 1) // Nodegroup with ready node.
 	provider1.AddNode("ng1", ready1)
 	provider1.AddNodeGroup("ng2", 1, 10, 1) // Nodegroup with ready and unready node.
@@ -158,21 +160,23 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	provider1.AddNode("ng4", ready6)
 
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
-	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
+	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil)
 
-	predicateChecker, err := simulator.NewTestPredicateChecker()
+	nodes := []*apiv1.Node{unready4, unready3, ready2, ready1}
+	snapshot := testsnapshot.NewTestSnapshotOrDie(t)
+	err := snapshot.SetClusterState(nodes, nil, drasnapshot.Snapshot{})
 	assert.NoError(t, err)
 
 	// Fill cache
 	ctx := context.AutoscalingContext{
-		CloudProvider:    provider1,
-		PredicateChecker: predicateChecker,
+		CloudProvider:   provider1,
+		ClusterSnapshot: snapshot,
 		AutoscalingKubeClients: context.AutoscalingKubeClients{
 			ListerRegistry: registry,
 		},
 	}
-	niProcessor := NewMixedTemplateNodeInfoProvider(&cacheTtl)
-	res, err := niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	niProcessor := NewMixedTemplateNodeInfoProvider(&cacheTtl, false)
+	res, err := niProcessor.Process(&ctx, nodes, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	// Check results
 	assert.Equal(t, 4, len(res))
@@ -206,7 +210,7 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	assert.Equal(t, "ng3", lastDeletedGroup)
 
 	// Check cache with all nodes removed
-	res, err = niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	res, err = niProcessor.Process(&ctx, nodes, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	// Check results
 	assert.Equal(t, 2, len(res))
@@ -225,10 +229,9 @@ func TestGetNodeInfosForGroupsCache(t *testing.T) {
 	assert.False(t, found)
 
 	// Fill cache manually
-	infoNg4Node6 := schedulerframework.NewNodeInfo()
-	infoNg4Node6.SetNode(ready6.DeepCopy())
+	infoNg4Node6 := framework.NewTestNodeInfo(ready6.DeepCopy())
 	niProcessor.nodeInfoCache = map[string]cacheItem{"ng4": {NodeInfo: infoNg4Node6, added: now}}
-	res, err = niProcessor.Process(&ctx, []*apiv1.Node{unready4, unready3, ready2, ready1}, []*appsv1.DaemonSet{}, nil, now)
+	res, err = niProcessor.Process(&ctx, nodes, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	// Check if cache was used
 	assert.NoError(t, err)
 	assert.Equal(t, 2, len(res))
@@ -248,22 +251,24 @@ func TestGetNodeInfosCacheExpired(t *testing.T) {
 	// Cloud provider with TemplateNodeInfo not implemented.
 	provider := testprovider.NewTestAutoprovisioningCloudProvider(nil, nil, nil, nil, nil, nil)
 	podLister := kube_util.NewTestPodLister([]*apiv1.Pod{})
-	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil, nil)
-	predicateChecker, err := simulator.NewTestPredicateChecker()
+	registry := kube_util.NewListerRegistry(nil, nil, podLister, nil, nil, nil, nil, nil, nil)
+
+	nodes := []*apiv1.Node{ready1}
+	snapshot := testsnapshot.NewTestSnapshotOrDie(t)
+	err := snapshot.SetClusterState(nodes, nil, drasnapshot.Snapshot{})
 	assert.NoError(t, err)
 
 	ctx := context.AutoscalingContext{
-		CloudProvider:    provider,
-		PredicateChecker: predicateChecker,
+		CloudProvider:   provider,
+		ClusterSnapshot: snapshot,
 		AutoscalingKubeClients: context.AutoscalingKubeClients{
 			ListerRegistry: registry,
 		},
 	}
 	tn := BuildTestNode("tn", 5000, 5000)
-	tni := schedulerframework.NewNodeInfo()
-	tni.SetNode(tn)
+	tni := framework.NewTestNodeInfo(tn)
 	// Cache expire time is set.
-	niProcessor1 := NewMixedTemplateNodeInfoProvider(&cacheTtl)
+	niProcessor1 := NewMixedTemplateNodeInfoProvider(&cacheTtl, false)
 	niProcessor1.nodeInfoCache = map[string]cacheItem{
 		"ng1": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
 		"ng2": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
@@ -272,18 +277,18 @@ func TestGetNodeInfosCacheExpired(t *testing.T) {
 	provider.AddNode("ng1", ready1)
 
 	assert.Equal(t, 2, len(niProcessor1.nodeInfoCache))
-	_, err = niProcessor1.Process(&ctx, []*apiv1.Node{ready1}, []*appsv1.DaemonSet{}, nil, now)
+	_, err = niProcessor1.Process(&ctx, nodes, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(niProcessor1.nodeInfoCache))
 
 	// Cache expire time isn't set.
-	niProcessor2 := NewMixedTemplateNodeInfoProvider(nil)
+	niProcessor2 := NewMixedTemplateNodeInfoProvider(nil, false)
 	niProcessor2.nodeInfoCache = map[string]cacheItem{
 		"ng1": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
 		"ng2": {NodeInfo: tni, added: now.Add(-2 * time.Second)},
 	}
 	assert.Equal(t, 2, len(niProcessor2.nodeInfoCache))
-	_, err = niProcessor1.Process(&ctx, []*apiv1.Node{ready1}, []*appsv1.DaemonSet{}, nil, now)
+	_, err = niProcessor1.Process(&ctx, nodes, []*appsv1.DaemonSet{}, taints.TaintConfig{}, now)
 	assert.NoError(t, err)
 	assert.Equal(t, 2, len(niProcessor2.nodeInfoCache))
 

@@ -31,8 +31,8 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	provisioningv1 "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/rancher/provisioning.cattle.io/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	klog "k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/utils/pointer"
 )
 
@@ -46,6 +46,7 @@ type nodeGroup struct {
 	maxSize   int
 	resources corev1.ResourceList
 	replicas  int
+	machines  []unstructured.Unstructured
 }
 
 type node struct {
@@ -112,7 +113,7 @@ func (ng *nodeGroup) DeleteNodes(toDelete []*corev1.Node) error {
 	}
 
 	for _, del := range toDelete {
-		node, err := ng.findNodeByProviderID(rke2ProviderIDPrefix + del.Name)
+		node, err := ng.findNodeByProviderID(del.Spec.ProviderID)
 		if err != nil {
 			return err
 		}
@@ -131,6 +132,11 @@ func (ng *nodeGroup) DeleteNodes(toDelete []*corev1.Node) error {
 	}
 
 	return nil
+}
+
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (ng *nodeGroup) ForceDeleteNodes(nodes []*corev1.Node) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 func (ng *nodeGroup) findNodeByProviderID(providerID string) (*node, error) {
@@ -162,6 +168,11 @@ func (ng *nodeGroup) IncreaseSize(delta int) error {
 	return ng.setSize(newSize)
 }
 
+// AtomicIncreaseSize is not implemented.
+func (ng *nodeGroup) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // TargetSize returns the current TARGET size of the node group. It is possible that the
 // number is different from the number of nodes registered in Kubernetes.
 func (ng *nodeGroup) TargetSize() (int, error) {
@@ -190,7 +201,7 @@ func (ng *nodeGroup) DecreaseTargetSize(delta int) error {
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (ng *nodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (ng *nodeGroup) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   fmt.Sprintf("%s-%s-%d", ng.provider.config.ClusterName, ng.Id(), rand.Int63()),
@@ -210,9 +221,7 @@ func (ng *nodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 	node.Status.Allocatable = node.Status.Capacity
 
 	// Setup node info template
-	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(ng.Id()))
-	nodeInfo.SetNode(node)
-
+	nodeInfo := framework.NewNodeInfo(node, nil, &framework.PodInfo{Pod: cloudprovider.BuildKubeProxy(ng.Id())})
 	return nodeInfo, nil
 }
 
@@ -274,7 +283,7 @@ func (ng *nodeGroup) setSize(size int) error {
 // getting the underlying machines and extracting the providerID, which
 // corresponds to the name of the k8s node object.
 func (ng *nodeGroup) nodes() ([]node, error) {
-	machines, err := ng.machines()
+	machines, err := ng.listMachines()
 	if err != nil {
 		return nil, err
 	}
@@ -328,9 +337,13 @@ func (ng *nodeGroup) nodes() ([]node, error) {
 	return nodes, nil
 }
 
-// machines returns the unstructured objects of all cluster-api machines in a
-// node group. The machines are found using the deployment name label.
-func (ng *nodeGroup) machines() ([]unstructured.Unstructured, error) {
+// listMachines returns the unstructured objects of all cluster-api machines
+// in a node group. The machines are found using the deployment name label.
+func (ng *nodeGroup) listMachines() ([]unstructured.Unstructured, error) {
+	if ng.machines != nil {
+		return ng.machines, nil
+	}
+
 	machinesList, err := ng.provider.client.Resource(machineGVR(ng.provider.config.ClusterAPIVersion)).
 		Namespace(ng.provider.config.ClusterNamespace).List(
 		context.TODO(), metav1.ListOptions{
@@ -339,8 +352,27 @@ func (ng *nodeGroup) machines() ([]unstructured.Unstructured, error) {
 			LabelSelector: fmt.Sprintf("%s=%s-%s", machineDeploymentNameLabelKey, ng.provider.config.ClusterName, ng.name),
 		},
 	)
+	if err != nil {
+		return nil, fmt.Errorf("could not list machines: %w", err)
+	}
 
-	return machinesList.Items, err
+	ng.machines = machinesList.Items
+	return machinesList.Items, nil
+}
+
+func (ng *nodeGroup) machineByName(name string) (*unstructured.Unstructured, error) {
+	machines, err := ng.listMachines()
+	if err != nil {
+		return nil, fmt.Errorf("error listing machines in node group %s: %w", ng.name, err)
+	}
+
+	for _, machine := range machines {
+		if machine.GetName() == name {
+			return &machine, nil
+		}
+	}
+
+	return nil, fmt.Errorf("machine %s not found in list", name)
 }
 
 // markMachineForDeletion sets an annotation on the cluster-api machine
@@ -434,7 +466,7 @@ func parseResourceAnnotations(annotations map[string]string) (corev1.ResourceLis
 
 	cpuResources, err := resource.ParseQuantity(cpu)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse cpu resources: %s", cpu)
+		return nil, fmt.Errorf("unable to parse cpu resources: %q: %w", cpu, err)
 	}
 	memory, ok := annotations[resourceMemoryAnnotation]
 	if !ok {
@@ -443,7 +475,7 @@ func parseResourceAnnotations(annotations map[string]string) (corev1.ResourceLis
 
 	memoryResources, err := resource.ParseQuantity(memory)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse cpu resources: %s", cpu)
+		return nil, fmt.Errorf("unable to parse memory resources: %q: %w", memory, err)
 	}
 	ephemeralStorage, ok := annotations[resourceEphemeralStorageAnnotation]
 	if !ok {
@@ -452,7 +484,7 @@ func parseResourceAnnotations(annotations map[string]string) (corev1.ResourceLis
 
 	ephemeralStorageResources, err := resource.ParseQuantity(ephemeralStorage)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse cpu resources: %s", cpu)
+		return nil, fmt.Errorf("unable to parse ephemeral storage resources: %q: %w", ephemeralStorage, err)
 	}
 
 	return corev1.ResourceList{

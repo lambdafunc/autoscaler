@@ -154,7 +154,7 @@ func TestNodeGroupDeleteNodes(t *testing.T) {
 			expectedTargetSize: 0,
 			machines:           []runtime.Object{newMachine(nodeGroupDev, 0)},
 			toDelete: []*corev1.Node{
-				{ObjectMeta: v1.ObjectMeta{Name: nodeName(nodeGroupDev, 0)}},
+				newNode(nodeName(nodeGroupDev, 0)),
 			},
 		},
 		{
@@ -168,8 +168,8 @@ func TestNodeGroupDeleteNodes(t *testing.T) {
 			expectedTargetSize: 1,
 			machines:           []runtime.Object{newMachine(nodeGroupDev, 0), newMachine(nodeGroupDev, 1), newMachine(nodeGroupDev, 2)},
 			toDelete: []*corev1.Node{
-				{ObjectMeta: v1.ObjectMeta{Name: nodeName(nodeGroupDev, 0)}},
-				{ObjectMeta: v1.ObjectMeta{Name: nodeName(nodeGroupDev, 2)}},
+				newNode(nodeName(nodeGroupDev, 0)),
+				newNode(nodeName(nodeGroupDev, 2)),
 			},
 		},
 		{
@@ -184,7 +184,7 @@ func TestNodeGroupDeleteNodes(t *testing.T) {
 			expectedErrContains: fmt.Sprintf("node with providerID rke2://%s not found in node group %s", nodeName(nodeGroupDev, 42), nodeGroupDev),
 			machines:            []runtime.Object{newMachine(nodeGroupDev, 0)},
 			toDelete: []*corev1.Node{
-				{ObjectMeta: v1.ObjectMeta{Name: nodeName(nodeGroupDev, 42)}},
+				newNode(nodeName(nodeGroupDev, 42)),
 			},
 		},
 		{
@@ -236,7 +236,9 @@ func TestNodeGroupDeleteNodes(t *testing.T) {
 				t.Fatalf("expected target size %v, got %v", tc.expectedTargetSize, targetSize)
 			}
 
-			machines, err := tc.nodeGroup.machines()
+			// ensure we get fresh machines
+			tc.nodeGroup.machines = nil
+			machines, err := tc.nodeGroup.listMachines()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -394,19 +396,19 @@ func TestTemplateNodeInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if nodeInfo.Allocatable.MilliCPU != ng.resources.Cpu().MilliValue() {
+	if nodeInfo.ToScheduler().Allocatable.MilliCPU != ng.resources.Cpu().MilliValue() {
 		t.Fatalf("expected nodeInfo to have %v MilliCPU, got %v",
-			ng.resources.Cpu().MilliValue(), nodeInfo.Allocatable.MilliCPU)
+			ng.resources.Cpu().MilliValue(), nodeInfo.ToScheduler().Allocatable.MilliCPU)
 	}
 
-	if nodeInfo.Allocatable.Memory != ng.resources.Memory().Value() {
+	if nodeInfo.ToScheduler().Allocatable.Memory != ng.resources.Memory().Value() {
 		t.Fatalf("expected nodeInfo to have %v Memory, got %v",
-			ng.resources.Memory().Value(), nodeInfo.Allocatable.Memory)
+			ng.resources.Memory().Value(), nodeInfo.ToScheduler().Allocatable.Memory)
 	}
 
-	if nodeInfo.Allocatable.EphemeralStorage != ng.resources.StorageEphemeral().Value() {
+	if nodeInfo.ToScheduler().Allocatable.EphemeralStorage != ng.resources.StorageEphemeral().Value() {
 		t.Fatalf("expected nodeInfo to have %v ephemeral storage, got %v",
-			ng.resources.StorageEphemeral().Value(), nodeInfo.Allocatable.EphemeralStorage)
+			ng.resources.StorageEphemeral().Value(), nodeInfo.ToScheduler().Allocatable.EphemeralStorage)
 	}
 }
 
@@ -548,12 +550,13 @@ func newMachine(nodeGroupName string, num int) *unstructured.Unstructured {
 				"name":      nodeName(nodeGroupName, num),
 				"namespace": testNamespace,
 				"labels": map[string]interface{}{
-					machineDeploymentNameLabelKey: fmt.Sprintf("%s-%s", testCluster, nodeGroupName),
+					machineDeploymentNameLabelKey:  fmt.Sprintf("%s-%s", testCluster, nodeGroupName),
+					rancherMachinePoolNameLabelKey: nodeGroupName,
 				},
 			},
 			"spec": map[string]interface{}{
 				"clusterName": testCluster,
-				"providerID":  rke2ProviderIDPrefix + nodeName(nodeGroupName, num),
+				"providerID":  testProviderID + nodeName(nodeGroupName, num),
 			},
 			"status": map[string]interface{}{
 				"phase": "Running",
@@ -564,4 +567,13 @@ func newMachine(nodeGroupName string, num int) *unstructured.Unstructured {
 
 func nodeName(nodeGroupName string, num int) string {
 	return fmt.Sprintf("%s-%s-123456-%v", testCluster, nodeGroupName, num)
+}
+
+func newNode(name string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: v1.ObjectMeta{Name: name},
+		Spec: corev1.NodeSpec{
+			ProviderID: testProviderID + name,
+		},
+	}
 }

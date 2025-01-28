@@ -19,7 +19,6 @@ package exoscale
 import (
 	"context"
 	"math/rand"
-	"os"
 	"testing"
 	"time"
 
@@ -125,11 +124,11 @@ type cloudProviderTestSuite struct {
 }
 
 func (ts *cloudProviderTestSuite) SetupTest() {
-	_ = os.Setenv("EXOSCALE_ZONE", testZone)
-	_ = os.Setenv("EXOSCALE_API_KEY", "x")
-	_ = os.Setenv("EXOSCALE_API_SECRET", "x")
+	ts.T().Setenv("EXOSCALE_ZONE", testZone)
+	ts.T().Setenv("EXOSCALE_API_KEY", "x")
+	ts.T().Setenv("EXOSCALE_API_SECRET", "x")
 
-	manager, err := newManager()
+	manager, err := newManager(cloudprovider.NodeGroupDiscoveryOptions{})
 	if err != nil {
 		ts.T().Fatalf("error initializing cloud provider manager: %v", err)
 	}
@@ -215,6 +214,17 @@ func (ts *cloudProviderTestSuite) TestExoscaleCloudProvider_NodeGroupForNode_Ins
 }
 
 func (ts *cloudProviderTestSuite) TestExoscaleCloudProvider_NodeGroupForNode_SKSNodepool() {
+	ts.p.manager.client.(*exoscaleClientMock).
+		On("GetQuota", ts.p.manager.ctx, ts.p.manager.zone, testComputeInstanceQuotaName).
+		Return(
+			&egoscale.Quota{
+				Resource: &testComputeInstanceQuotaName,
+				Usage:    &testComputeInstanceQuotaUsage,
+				Limit:    &testComputeInstanceQuotaLimit,
+			},
+			nil,
+		)
+
 	ts.p.manager.client.(*exoscaleClientMock).
 		On("ListSKSClusters", ts.p.manager.ctx, ts.p.manager.zone).
 		Return(
@@ -313,6 +323,17 @@ func (ts *cloudProviderTestSuite) TestExoscaleCloudProvider_NodeGroups() {
 	// we mock 1 Instance Pool based Nodegroup and 1 SKS Nodepool based
 	// Nodegroup. If everything works as expected, the
 	// cloudprovider.NodeGroups() method should return 2 Nodegroups.
+
+	ts.p.manager.client.(*exoscaleClientMock).
+		On("GetQuota", ts.p.manager.ctx, ts.p.manager.zone, testComputeInstanceQuotaName).
+		Return(
+			&egoscale.Quota{
+				Resource: &testComputeInstanceQuotaName,
+				Usage:    &testComputeInstanceQuotaUsage,
+				Limit:    &testComputeInstanceQuotaLimit,
+			},
+			nil,
+		)
 
 	ts.p.manager.client.(*exoscaleClientMock).
 		On("GetInstancePool", ts.p.manager.ctx, ts.p.manager.zone, instancePoolID).

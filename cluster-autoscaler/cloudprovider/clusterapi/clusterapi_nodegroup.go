@@ -18,11 +18,18 @@ package clusterapi
 
 import (
 	"fmt"
+	"math/rand"
+	"strconv"
+	"time"
+
+	"k8s.io/klog/v2"
+
 	"github.com/pkg/errors"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
@@ -30,6 +37,11 @@ import (
 
 const (
 	debugFormat = "%s (min: %d, max: %d, replicas: %d)"
+
+	// The default for the maximum number of pods is inspired by the Kubernetes
+	// best practices documentation for large clusters.
+	// see https://kubernetes.io/docs/setup/best-practices/cluster-large/
+	defaultMaxPods = 110
 )
 
 type nodegroup struct {
@@ -80,6 +92,11 @@ func (ng *nodegroup) IncreaseSize(delta int) error {
 	return ng.scalableResource.SetSize(size + delta)
 }
 
+// AtomicIncreaseSize is not implemented.
+func (ng *nodegroup) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DeleteNodes deletes nodes from this node group. Error is returned
 // either on failure or if the given node doesn't belong to this node
 // group. This function should wait until node group size is updated.
@@ -94,7 +111,7 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 	}
 
 	// if we are at minSize already we wail early.
-	if int(replicas) <= ng.MinSize() {
+	if replicas <= ng.MinSize() {
 		return fmt.Errorf("min size reached, nodes will not be deleted")
 	}
 
@@ -158,6 +175,11 @@ func (ng *nodegroup) DeleteNodes(nodes []*corev1.Node) error {
 	}
 
 	return nil
+}
+
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (ng *nodegroup) ForceDeleteNodes(nodes []*corev1.Node) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 // DecreaseTargetSize decreases the target size of the node group.
@@ -233,8 +255,57 @@ func (ng *nodegroup) Nodes() ([]cloudprovider.Instance, error) {
 // allocatable information as well as all pods that are started on the
 // node by default, using manifest (most likely only kube-proxy).
 // Implementation optional.
-func (ng *nodegroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
+func (ng *nodegroup) TemplateNodeInfo() (*framework.NodeInfo, error) {
+	if !ng.scalableResource.CanScaleFromZero() {
+		return nil, cloudprovider.ErrNotImplemented
+	}
+
+	capacity, err := ng.scalableResource.InstanceCapacity()
+	if err != nil {
+		return nil, err
+	}
+
+	nodeName := fmt.Sprintf("%s-asg-%d", ng.scalableResource.Name(), rand.Int63())
+	node := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   nodeName,
+			Labels: map[string]string{},
+		},
+	}
+
+	node.Status.Capacity = capacity
+	node.Status.Allocatable = capacity
+	node.Status.Conditions = cloudprovider.BuildReadyConditions()
+	node.Spec.Taints = ng.scalableResource.Taints()
+
+	node.Labels, err = ng.buildTemplateLabels(nodeName)
+	if err != nil {
+		return nil, err
+	}
+
+	nodeInfo := framework.NewNodeInfo(&node, nil, &framework.PodInfo{Pod: cloudprovider.BuildKubeProxy(ng.scalableResource.Name())})
+	return nodeInfo, nil
+}
+
+func (ng *nodegroup) buildTemplateLabels(nodeName string) (map[string]string, error) {
+	labels := cloudprovider.JoinStringMaps(buildGenericLabels(nodeName), ng.scalableResource.Labels())
+
+	nodes, err := ng.Nodes()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(nodes) > 0 {
+		node, err := ng.machineController.findNodeByProviderID(normalizedProviderString(nodes[0].Id))
+		if err != nil {
+			return nil, err
+		}
+
+		if node != nil {
+			labels = cloudprovider.JoinStringMaps(labels, extractNodeLabels(node))
+		}
+	}
+	return labels, nil
 }
 
 // Exist checks if the node group really exists on the cloud nodegroup
@@ -270,7 +341,28 @@ func (ng *nodegroup) Autoprovisioned() bool {
 // GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
 // NodeGroup. Returning a nil will result in using default options.
 func (ng *nodegroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	options := ng.scalableResource.autoscalingOptions
+	if options == nil || len(options) == 0 {
+		return &defaults, nil
+	}
+
+	if opt, ok := getFloat64Option(options, ng.Id(), config.DefaultScaleDownUtilizationThresholdKey); ok {
+		defaults.ScaleDownUtilizationThreshold = opt
+	}
+	if opt, ok := getFloat64Option(options, ng.Id(), config.DefaultScaleDownGpuUtilizationThresholdKey); ok {
+		defaults.ScaleDownGpuUtilizationThreshold = opt
+	}
+	if opt, ok := getDurationOption(options, ng.Id(), config.DefaultScaleDownUnneededTimeKey); ok {
+		defaults.ScaleDownUnneededTime = opt
+	}
+	if opt, ok := getDurationOption(options, ng.Id(), config.DefaultScaleDownUnreadyTimeKey); ok {
+		defaults.ScaleDownUnreadyTime = opt
+	}
+	if opt, ok := getDurationOption(options, ng.Id(), config.DefaultMaxNodeProvisionTimeKey); ok {
+		defaults.MaxNodeProvisionTime = opt
+	}
+
+	return &defaults, nil
 }
 
 func newNodeGroupFromScalableResource(controller *machineController, unstructuredScalableResource *unstructured.Unstructured) (*nodegroup, error) {
@@ -289,14 +381,19 @@ func newNodeGroupFromScalableResource(controller *machineController, unstructure
 		return nil, err
 	}
 
-	// We don't scale from 0 so nodes must belong to a nodegroup
-	// that has a scale size of at least 1.
-	if found && replicas == 0 {
+	// Ensure that if the nodegroup has 0 replicas it is capable
+	// of scaling before adding it.
+	if found && replicas == 0 && !scalableResource.CanScaleFromZero() {
 		return nil, nil
 	}
 
 	// Ensure the node group would have the capacity to scale
-	if scalableResource.MaxSize()-scalableResource.MinSize() < 1 {
+	// allow MinSize = 0
+	// allow MaxSize = MinSize
+	// don't allow MaxSize < MinSize
+	// don't allow MaxSize = MinSize = 0
+	if scalableResource.MaxSize()-scalableResource.MinSize() < 0 || scalableResource.MaxSize() == 0 {
+		klog.V(4).Infof("nodegroup %s has no scaling capacity, skipping", scalableResource.Name())
 		return nil, nil
 	}
 
@@ -304,4 +401,74 @@ func newNodeGroupFromScalableResource(controller *machineController, unstructure
 		machineController: controller,
 		scalableResource:  scalableResource,
 	}, nil
+}
+
+func buildGenericLabels(nodeName string) map[string]string {
+	// TODO revisit this function and add an explanation about what these
+	// labels are used for, or remove them if not necessary
+	m := make(map[string]string)
+	m[corev1.LabelArchStable] = GetDefaultScaleFromZeroArchitecture().Name()
+
+	m[corev1.LabelOSStable] = cloudprovider.DefaultOS
+
+	m[corev1.LabelHostname] = nodeName
+	return m
+}
+
+// extract a predefined list of labels from the existing node
+func extractNodeLabels(node *corev1.Node) map[string]string {
+	m := make(map[string]string)
+	if node.Labels == nil {
+		return m
+	}
+
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelArchStable)
+
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelOSStable)
+
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelInstanceType)
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelInstanceTypeStable)
+
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelZoneRegion)
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelZoneRegionStable)
+
+	setLabelIfNotEmpty(m, node.Labels, corev1.LabelZoneFailureDomain)
+
+	return m
+}
+
+func setLabelIfNotEmpty(to, from map[string]string, key string) {
+	if value := from[key]; value != "" {
+		to[key] = value
+	}
+}
+
+func getFloat64Option(options map[string]string, templateName, name string) (float64, bool) {
+	raw, ok := options[name]
+	if !ok {
+		return 0, false
+	}
+
+	option, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		klog.Warningf("failed to convert autoscaling_options option %q (value %q) for scalable resource %q to float: %v", name, raw, templateName, err)
+		return 0, false
+	}
+
+	return option, true
+}
+
+func getDurationOption(options map[string]string, templateName, name string) (time.Duration, bool) {
+	raw, ok := options[name]
+	if !ok {
+		return 0, false
+	}
+
+	option, err := time.ParseDuration(raw)
+	if err != nil {
+		klog.Warningf("failed to convert autoscaling_options option %q (value %q) for scalable resource %q to duration: %v", name, raw, templateName, err)
+		return 0, false
+	}
+
+	return option, true
 }
